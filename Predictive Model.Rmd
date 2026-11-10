@@ -1,0 +1,172 @@
+---
+title: "Predictive"
+author: "Naqib Nazri"
+date: "2025-10-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(shiny)
+library(tidyverse)
+library(lubridate)
+library(forecast)
+library(DT)
+library(zoo)
+```
+
+
+```{r}
+
+DATA_FILE <- "Countries Over Time.csv"   # <-- put your historical file here
+
+ui <- fluidPage(
+  titlePanel("Forecast: U.S. Trade Balance by Country"),
+  sidebarLayout(
+    sidebarPanel(
+      selectInput("country", "Select a Country", choices = NULL),
+      helpText("Trade Balance = Exports − Imports"),
+      checkboxInput("show_test", "Show Train/Test (last 12 months)", TRUE)
+    ),
+    mainPanel(
+      h4("Historical Trade Balance"),
+      plotOutput("ts_plot", height = 260),
+      conditionalPanel(
+        condition = "input.show_test == true",
+        h4("Train → Test Forecast"),
+        plotOutput("tt_plot", height = 260),
+        DTOutput("acc_table"),
+        hr()
+      ),
+      h4("Forecast for 12 months ahead"),
+      plotOutput("fc_plot", height = 260),
+      DTOutput("fc_table")
+    )
+  )
+)
+
+server <- function(input, output, session){
+
+  # ---- 1) Read & check data ----
+  df <- reactive({
+    validate(need(file.exists(DATA_FILE),
+                  paste0("Cannot find '", DATA_FILE, "'. Put it in the app directory.")))
+
+    dat <- readr::read_csv(DATA_FILE, show_col_types = FALSE)
+
+    needed <- c("Country","Month","Year",
+                "Total Exports Value ($US)",
+                "Customs Import Value (Gen) ($US)")
+    missing <- setdiff(needed, names(dat))
+    validate(need(length(missing) == 0,
+                  paste("Missing columns:", paste(missing, collapse=", "))))
+
+    dat %>%
+      mutate(
+        date = my(paste(Month, Year), quiet = TRUE),
+        `Trade Balance ($US)` =
+          as.numeric(`Total Exports Value ($US)`) -
+          as.numeric(`Customs Import Value (Gen) ($US)`)
+      ) %>%
+      filter(!is.na(date), !is.na(`Trade Balance ($US)`)) %>%
+      arrange(Country, date)
+  })
+
+  observe({
+    updateSelectInput(session, "country",
+                      choices = sort(unique(df()$Country)),
+                      selected = head(sort(unique(df()$Country)), 1))
+  })
+
+  # ---- 2) Build TS safely ----
+  ts_data <- reactive({
+    req(input$country)
+    d <- df() %>% filter(Country == input$country)
+    validate(need(nrow(d) >= 6, "Not enough data for this country."))
+
+    start <- c(year(min(d$date)), month(min(d$date)))
+    y <- ts(d$`Trade Balance ($US)`, start = start, frequency = 12)
+    # If all NA/constant, guard
+    validate(need(sum(!is.na(y)) >= 6, "Series too sparse."))
+
+    y
+  })
+
+  # ---- 3) Train/Test split (robust) ----
+  tt <- reactive({
+  y <- ts_data()
+  n <- length(y)
+  h <- min(12, max(3, floor(n/6)))
+
+  start_time <- tsp(y)[1]
+  freq <- frequency(y)
+  end_train_time  <- start_time + (n - h - 1) / freq
+  start_test_time <- start_time + (n - h)     / freq
+
+  train_ts <- window(y, end   = end_train_time)
+  test_ts  <- window(y, start = start_test_time)
+
+  list(y = y, h = h, train = train_ts, test = test_ts)
+})
+
+
+  # ---- 4) Fit & Forecast with guards ----
+  fit_tt <- reactive({
+    tryCatch(
+      auto.arima(tt()$train, seasonal = TRUE, stepwise = FALSE, approximation = FALSE),
+      error = function(e) NULL
+    )
+  })
+  fc_tt <- reactive({
+    validate(need(!is.null(fit_tt()), "Model failed to fit on training data."))
+    forecast(fit_tt(), h = length(tt()$test))
+  })
+  acc <- reactive({
+    as.data.frame(accuracy(fc_tt(), tt()$test)) %>%
+      tibble::rownames_to_column("Set") %>%
+      select(Set, ME, RMSE, MAE, MAPE, ACF1)
+  })
+
+  fit_all <- reactive({
+    tryCatch(
+      auto.arima(tt()$y, seasonal = TRUE, stepwise = FALSE, approximation = FALSE),
+      error = function(e) NULL
+    )
+  })
+  fc_final <- reactive({
+    validate(need(!is.null(fit_all()), "Model failed to fit on full data."))
+    forecast(fit_all(), h = 12)
+  })
+
+  fc_table <- reactive({
+    tibble(
+      Month = as.Date(as.yearmon(time(fc_final()$mean))),
+      Forecast = as.numeric(fc_final()$mean),
+      Lower95  = as.numeric(fc_final()$lower[,2]),
+      Upper95  = as.numeric(fc_final()$upper[,2])
+    )
+  })
+
+  # ---- 5) Outputs ----
+  output$ts_plot <- renderPlot({
+    autoplot(tt()$y) + labs(x="Year", y="USD") + theme_minimal()
+  })
+
+  output$acc_table <- renderDT({
+    req(input$show_test)
+    datatable(acc(), options = list(pageLength = 5, dom = 't'), rownames = FALSE) %>%
+      formatRound(c("RMSE","MAE","MAPE"), 2)
+  })
+
+  output$fc_plot <- renderPlot({
+    autoplot(fc_final()) + theme_minimal() + labs(x="Year", y="USD")
+  })
+
+  output$fc_table <- renderDT({
+    datatable(fc_table(), options = list(pageLength = 12), rownames = FALSE) %>%
+      formatRound(c("Forecast","Lower95","Upper95"), 2)
+  })
+}
+
+shinyApp(ui, server)
+```
