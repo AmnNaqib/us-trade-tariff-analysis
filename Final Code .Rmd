@@ -1,0 +1,976 @@
+---
+title: "Question 1"
+output: html_document
+date: "2025-10-10"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+library(tidyverse)
+library(dplyr)
+library(stringr)
+library(shiny)
+library(scales)
+library(DT)
+library(ggplot2)
+library(broom)
+library(tidyr)
+library(readr)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(sf)
+library(plotly)
+library(lubridate)
+library(countrycode)
+library(leaflet)
+library(viridisLite)
+
+```
+
+```{r}
+
+data = read.csv("cleaned_data.csv")
+
+```
+
+#QUESTION 3
+
+```{r}
+
+usa_cpi_gdp = read.csv("USA_CPI_GDP_Annual.csv")
+
+```
+
+
+```{r}
+merged_df <- merge(data, usa_cpi_gdp, by = "Year") %>% filter(Commodity == "All Commodities") %>% 
+  mutate(
+    trade_volume = Total.Export.US + Total.Import.US,
+    Year = as.numeric(Year)
+  )
+merged_df
+```
+
+
+```{r}
+model_pooled = lm(trade_volume ~ GDP_Current_USD + CPI_Annual + trade_balance_ratio, data = merged_df)
+summary(model_pooled)
+
+```
+
+```{r}
+clean_df <- merged_df %>%
+  filter(!is.na(trade_volume),
+         !is.na(GDP_Current_USD),
+         !is.na(CPI_Annual),
+         !is.na(trade_balance_ratio))
+
+countries <- sort(unique(clean_df$Country))
+```
+
+
+```{r}
+country_models = clean_df %>% 
+  group_by(Country) %>% 
+  do(tidy(lm(trade_volume ~ GDP_Current_USD + CPI_Annual + trade_balance_ratio, data = .)))
+```
+
+
+```{r}
+head(country_models)
+```
+
+
+```{r}
+trade_results = country_models %>% 
+  filter(term == "trade_balance_ratio") %>% 
+  select(Country, estimate, std.error, statistic, p.value)
+```
+
+```{r}
+trade_results = trade_results %>%  
+  mutate(significant = ifelse(p.value < 0.05, "Yes", "No"))
+trade_results
+
+#If countries that have p-value < 0.05, it shows that tariff balance ratio significantly affects trade volume
+```
+
+```{r}
+write.csv(trade_results, "question3.csv", row.names = F)
+```
+
+```{r}
+ui <- fluidPage(
+  titlePanel("Trade Volume & Trade Balance Ratio Dashboard"),
+
+  fluidRow(
+    column(6, selectInput("country", "Select Country",
+                          choices = countries,
+                          selected = countries[1])),
+    column(6, checkboxInput("show_regression", "Show Regression Results", TRUE))
+  ),
+
+  # Two plots, stacked vertically
+  fluidRow(
+    column(12, plotOutput("volume_plot", height = 300)),
+    column(12, plotOutput("trade_plot", height = 300))
+  ),
+
+  tags$br(),
+
+  conditionalPanel(
+    condition = "input.show_regression == true",
+    h4("Regression Results (Trade Volume ~ GDP + CPI + Trade Balance Ratio)"),
+    tableOutput("regression_tbl"),
+    tags$br(),
+    h4("Summary Statistics (Trade Volume & Trade Ratio)"),
+    tableOutput("summary_tbl")
+  )
+)
+
+# ---- SERVER ----
+server <- function(input, output, session) {
+
+  # Reactive dataset by selected country
+  series <- reactive({
+    req(input$country)
+    clean_df %>% filter(Country == input$country)
+  })
+
+  # ---- Plot 1: Trade Volume ----
+ output$volume_plot <- renderPlot({
+  df <- series()
+
+  ggplot(df, aes(x = factor(Year), y = trade_volume)) +
+    geom_col(fill = "#1f77b4", alpha = 0.8) +
+    scale_y_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+    labs(
+      title = paste("Trade Volume by Year —", input$country),
+      x = "Year", y = "Trade Volume (US$)"
+    ) +
+    theme_minimal(base_size = 13)
+})
+
+# ---- Plot 2: Trade Balance Ratio (Discrete by Year, bar style) ----
+output$trade_plot <- renderPlot({
+  df <- series()
+
+  ggplot(df, aes(x = factor(Year), y = trade_balance_ratio)) +
+    geom_col(fill = "#d62728", alpha = 0.8) +
+    labs(
+      title = paste("Trade Balance Ratio by Year —", input$country),
+      x = "Year", y = "Trade Balance Ratio"
+    ) +
+    theme_minimal(base_size = 13)
+})
+
+  # ---- Regression Table ----
+  output$regression_tbl <- renderTable({
+    df <- series()
+    if (nrow(df) < 3) {
+      return(tibble(Message = "Not enough data points for regression."))
+    }
+
+    model <- lm(trade_volume ~ GDP_Current_USD + CPI_Annual + trade_balance_ratio, data = df)
+
+    broom::tidy(model) %>%
+      mutate(
+        estimate = round(estimate, 3),
+        std.error = round(std.error, 3),
+        p.value = round(p.value, 4),
+        Significance = case_when(
+          p.value < 0.01 ~ "***",
+          p.value < 0.05 ~ "**",
+          p.value < 0.1  ~ "*",
+          TRUE ~ ""
+        )
+      ) %>%
+      select(term, estimate, std.error, statistic, p.value, Significance)
+  })
+
+  # ---- Summary Table ----
+  output$summary_tbl <- renderTable({
+    df <- series()
+    tibble(
+      Variable = c("Trade Volume", "Trade Ratio"),
+      Mean = c(mean(df$trade_volume, na.rm = TRUE),
+               mean(df$trade_balance_ratio, na.rm = TRUE)),
+      SD = c(sd(df$trade_volume, na.rm = TRUE),
+             sd(df$trade_balance_ratio, na.rm = TRUE))
+    ) %>%
+      mutate(CV = round((SD / Mean) * 100, 2))
+  }, align = "lrrr", rownames = FALSE)
+}
+
+# ---- Run App ----
+shinyApp(ui, server)
+
+```
+
+```{r}
+years <- sort(unique(clean_df$Year))
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+# ---- UI ----
+ui <- fluidPage(
+  titlePanel("Trade Volume Dashboard"),
+
+  fluidRow(
+    column(6, selectInput("year", "Select Year",
+                          choices = years,
+                          selected = years[1]))
+  ),
+
+  fluidRow(
+    column(12, plotOutput("map_plot", height = "650px"))
+  ),
+
+  tags$br(),
+  p("Trade volume by country (exports + imports) for the selected year.",
+    style = "font-size:13px; color:#555;")
+)
+
+# ---- SERVER ----
+server <- function(input, output, session) {
+
+  series <- reactive({
+    req(input$year)
+    clean_df %>% filter(Year == input$year)
+  })
+
+  output$map_plot <- renderPlot({
+    df <- series()
+
+    # Merge directly without renaming
+    map_data <- world %>%
+      left_join(df, by = c("name" = "Country"))
+
+    # Identify top trading partner
+    top_country <- df %>%
+      filter(trade_volume == max(trade_volume, na.rm = TRUE)) %>%
+      pull(Country)
+
+    # Static ggplot map
+    ggplot(map_data) +
+      geom_sf(aes(fill = trade_volume), color = "white", size = 0.1) +
+      scale_fill_viridis_c(
+        option = "plasma",    # “plasma”, “magma”, “inferno”,“viridis”
+        direction = 1,              # 1 = low→high, -1 = reverse
+        na.value = "gray90",
+        labels = label_number(scale_cut = cut_short_scale()),
+        name = "Trade Volume (US$)"
+      ) +
+      labs(
+        title = paste("U.S. Trade Volume by Country —", input$year),
+        subtitle = paste("Top trading partner:", top_country),
+        caption = "Data source: your dataset"
+      ) +
+      theme_minimal(base_size = 13) +
+      theme(
+        legend.position = "right",
+        panel.background = element_rect(fill = "aliceblue"),
+        panel.grid.major = element_blank(),
+        axis.text = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank()
+      )
+  })
+}
+
+# ---- Run App ----
+shinyApp(ui, server)
+
+```
+
+
+#QUESTION 4
+
+```{r}
+
+ui <- fluidPage(
+  titlePanel("Trade Balance Stability with the U.S.(2015 through 2023)"),
+  fluidRow(
+    column(
+      8,
+      leafletOutput("map", height = 600),
+      tags$small("CV = sd(Balance) / mean(|Balance|); lower = more stable.")
+    ),
+    column(
+      4,
+      h4("Hovered / Selected"),
+      uiOutput("info_box"),
+      hr(),
+      h4("Rank by Stability (low CV = rank 1)"),
+      DTOutput("rank_tbl")
+    )
+  )
+)
+
+server <- function(input, output, session){
+
+  # -------- 1) Load & prep your data --------
+  data <- read_csv("cleaned_data.csv")
+
+  export_col <- "Total.Export.US"
+  import_col <- "Total.Import.US"
+
+  df_bal <- data %>%
+    filter(Commodity == "All Commodities") %>%
+    mutate(Year = as.numeric(Year)) %>%
+    group_by(Country, Year) %>%
+    summarise(
+      Exports = sum(.data[[export_col]], na.rm = TRUE),
+      Imports = sum(.data[[import_col]], na.rm = TRUE),
+      .groups = "drop_last"
+    ) %>%
+    mutate(Balance = Exports - Imports) %>%
+    ungroup()
+
+  cv_by_country <- df_bal %>%
+    group_by(Country) %>%
+    summarise(
+      n_years      = n(),
+      mean_balance = mean(Balance, na.rm = TRUE),
+      sd_balance   = sd(Balance,   na.rm = TRUE),
+      denom        = mean(abs(Balance), na.rm = TRUE),
+      cv_balance   = ifelse(denom > 0, sd_balance / denom, NA_real_),
+      .groups = "drop"
+    ) %>%
+    filter(n_years >= 5)
+
+  # rank: 1 = most stable (lowest CV)
+  cv_by_country <- cv_by_country %>%
+    arrange(cv_balance) %>%
+    mutate(rank = row_number())
+
+  # -------- 2) World polygons + merge --------
+  world <- ne_countries(scale = "medium", returnclass = "sf") |>
+    st_transform(4326) |>
+    mutate(iso3 = iso_a3)
+
+  cv_map <- cv_by_country %>%
+    mutate(iso3 = countrycode(Country, "country.name", "iso3c"))
+
+  world_cv <- world %>%
+    left_join(cv_map, by = c("iso3" = "iso3"))
+
+  # -------- 3) Palette & labels --------
+  pal <- colorBin(viridis(7, option = "C"),
+                  domain = world_cv$cv_balance,
+                  bins   = c(0, 0.25, 0.5, 0.75, 1, 1.5, 2, Inf),
+                  na.color = "#F0F0F0")
+
+  fmt_cv <- function(x) ifelse(is.na(x), "—", percent(x, accuracy = 0.1))
+
+  labels <- sprintf(
+    "<b>%s</b><br/>CV: %s<br/>Rank: %s",
+    world_cv$name_long,
+    fmt_cv(world_cv$cv_balance),
+    ifelse(is.na(world_cv$rank), "—", world_cv$rank)
+  ) |>
+    lapply(htmltools::HTML)
+
+  # -------- 4) Map --------
+  output$map <- renderLeaflet({
+    leaflet(world_cv, options = leafletOptions(minZoom = 1, maxZoom = 8)) |>
+      addProviderTiles(providers$CartoDB.Positron) |>
+      addPolygons(
+        weight = 0.5,
+        color = "#ffffff",
+        opacity = 1,
+        fillColor = ~pal(cv_balance),
+        fillOpacity = 0.9,
+        label = labels,
+        layerId = ~name_long,
+        highlightOptions = highlightOptions(weight = 2, color = "#333", bringToFront = TRUE)
+      ) |>
+      addLegend(
+        position = "bottomright",
+        pal = pal, values = world_cv$cv_balance,
+        title = "CV (balance)", opacity = 1,
+        labFormat = labelFormat(transform = function(x) x, digits = 2,
+                                suffix = "", between = " – ")
+      )
+  })
+
+  # -------- 5) Info box updates on hover/click --------
+  # Prefer click; if you want hover, use input$map_shape_mouseover
+  cur_country <- reactiveVal(NULL)
+
+  observeEvent(input$map_shape_mouseover, {
+    cur_country(input$map_shape_mouseover$id)
+  })
+  observeEvent(input$map_shape_click, {
+    cur_country(input$map_shape_click$id)
+  })
+
+  output$info_box <- renderUI({
+    nm <- cur_country()
+    row <- world_cv |> filter(name_long == nm)
+    if (nrow(row) == 0) {
+      div(em("Hover or click a country"))
+    } else {
+      cv <- row$cv_balance[1]
+      rk <- row$rank[1]
+      div(
+        tags$h5(nm),
+        tags$p(HTML(sprintf("CV: <b>%s</b><br/>Rank: <b>%s</b>",
+                            fmt_cv(cv), ifelse(is.na(rk), "—", rk))))
+      )
+    }
+  })
+
+  # -------- 6) Rank table (sortable/searchable) --------
+  rank_tbl_data <- cv_by_country %>%
+    select(Country, cv_balance, rank) %>%
+    arrange(rank) %>%
+    mutate(`CV (balance)` = fmt_cv(cv_balance)) %>%
+    select(Rank = rank, Country, `CV (balance)`)
+
+  output$rank_tbl <- renderDT({
+    datatable(rank_tbl_data, rownames = FALSE,
+              options = list(pageLength = 10, order = list(list(0, 'asc'))))
+  })
+}
+
+shinyApp(ui, server)
+
+```
+
+
+#QUESTION 1
+
+#PRODUCT SUBSTITUTION
+
+#Approximate the Tariff presure for each commodity in every year, based on import weights
+#Add column for total import & export for each commodity in every year
+
+```{r}
+
+
+product_sum = data %>% 
+  mutate(commodity_code = as.character(commodity_code)) %>% 
+  group_by(commodity_code, Year) %>%
+  mutate(grp_import = sum(Total.Import.US, na.rm = TRUE),
+         weight = if_else(grp_import > 0, Total.Import.US / grp_import, NA_real_)) %>% 
+  summarise(total_import = sum(Total.Import.US, na.rm = TRUE),
+          total_export = sum(Total.Export.US, na.rm = TRUE),
+          tbr_weighted = sum(trade_balance_ratio * weight, na.rm = TRUE),
+          tbr_sd = sd(trade_balance_ratio, na.rm = TRUE)) %>%
+  ungroup() %>% 
+  arrange(commodity_code, Year) %>% 
+  group_by(commodity_code) %>% 
+  mutate(weighted_tbr_change = tbr_weighted - lag(tbr_weighted),
+         import_change_pct = (total_import - lag(total_import))/ lag(total_import),
+         export_change_pct = (total_export - lag(total_export))/ lag(total_export)) %>% 
+  ungroup() 
+
+# this just capture the overall tariff pressure experienced by a category --> how much the category was affected over time.
+#but ignore the variation of tariff pressure apply for each country for each category
+#if the tariff are applied unevenly among countries --> the standard deviation is bigger 
+
+
+
+unique_code_name <- data %>%
+  mutate(commodity_code = as.character(commodity_code)) %>%
+  group_by(commodity_code, commodity_name) %>%
+  summarise(n = n(),
+            impsum = sum(Total.Import.US, na.rm = TRUE),
+            .groups = "drop") %>%
+  arrange(commodity_code, desc(n), desc(impsum)) %>%
+  group_by(commodity_code) %>% slice(1L) %>% ungroup() %>%
+  select(commodity_code, commodity_name)
+
+unique_code_name_extra = data %>% 
+  mutate(commodity_code = as.character(commodity_code)) %>%
+  distinct(commodity_code, .keep_all = TRUE) %>% 
+  select(Commodity, commodity_code) 
+
+product_sum <- product_sum %>%
+  left_join(unique_code_name, by = "commodity_code") %>%
+  left_join(unique_code_name_extra, by = "commodity_code") %>% 
+  relocate(commodity_code,commodity_name, Commodity, .before = Year)
+  
+
+```
+
+
+```{r}
+
+year_counts <- product_sum %>%
+  group_by(commodity_code, commodity_name) %>%
+  summarise(
+    n_years = n_distinct(Year),
+    first_year = min(Year, na.rm = TRUE),
+    last_year  = max(Year, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+product_sum = product_sum %>% 
+  left_join(year_counts, by = c("commodity_code", "commodity_name"))
+
+```
+
+
+
+
+```{r}
+
+correlation_comm = product_sum %>% 
+  filter(n_years >= 3 ) %>% 
+  # filter(str_length(commodity_code) > 3) %>% 
+  group_by(commodity_code, commodity_name) %>% 
+  summarise(cor_tbr_import = cor(weighted_tbr_change, import_change_pct, use = "complete.obs")) %>% 
+  ungroup() %>% 
+  arrange(cor_tbr_import)
+
+
+```
+
+
+```{r}
+
+
+top_corr <- correlation_comm %>%
+  filter(!is.na(cor_tbr_import)) %>%
+  arrange(cor_tbr_import) %>%
+  mutate(rank = row_number()) %>%
+  slice(1:20)  # top 20 substitution candidates
+
+top_corr
+```
+
+
+```{r}
+
+
+
+# helper: safe correlation
+safe_cor <- function(x, y) {
+  ok <- is.finite(x) & is.finite(y)
+  if (sum(ok) >= 2 && sd(x[ok]) > 0 && sd(y[ok]) > 0) cor(x[ok], y[ok]) else NA_real_
+}
+
+# add 4-digit subsector column
+product_sum <- product_sum %>%
+  mutate(
+    subsector4 = substr(commodity_code, 1, 4),
+    sector3    = substr(commodity_code, 1, 3)
+  )
+
+ui <- fluidPage(
+  titlePanel("Product Substitution by 4-digit Subsector (ΔTBR vs ΔImport)"),
+  sidebarLayout(
+    sidebarPanel(
+      selectInput(
+        "subsector4", "Choose a subsector (4-digit):",
+        choices = sort(unique(product_sum$subsector4)),
+        selected = sort(unique(product_sum$subsector4))[1]
+      ),
+      sliderInput(
+        "year_range", "Year range:",
+        min = min(product_sum$Year, na.rm = TRUE),
+        max = max(product_sum$Year, na.rm = TRUE),
+        value = c(min(product_sum$Year, na.rm = TRUE), max(product_sum$Year, na.rm = TRUE)),
+        step = 1, sep = ""
+      ),
+      numericInput("min_pairs", "Min. complete year-pairs per commodity:", 3, min = 2, max = 9, step = 1),
+      numericInput("topn", "Show top N (most negative correlations):", 15, min = 5, max = 50, step = 1)
+    ),
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Ranking",
+                 plotOutput("rank_plot", height = 480),
+                 DTOutput("rank_table")),
+        tabPanel("Scatter (per commodity)",
+                 uiOutput("pick_products_ui"),
+                 plotOutput("scatter_plot", height = 520)),
+        tabPanel("Trends",
+                 plotOutput("trend_plot", height = 520)),
+        tabPanel("Coverage",
+                 plotOutput("coverage_plot", height = 320))
+      )
+    )
+  )
+)
+
+
+
+server <- function(input, output, session) {
+
+  # filter to chosen 4-digit subsector and year range
+  subsector_df <- reactive({
+    req(input$subsector4)
+    product_sum %>%
+      filter(subsector4 == input$subsector4,
+             Year >= input$year_range[1],
+             Year <= input$year_range[2])
+  })
+
+  # compute per-commodity correlation within the chosen subsector
+  subsector_corr <- reactive({
+    df <- subsector_df()
+    df %>%
+      group_by(commodity_code, Commodity) %>%   # <-- use your combined label column
+      summarise(
+        n_pairs        = sum(is.finite(weighted_tbr_change) & is.finite(import_change_pct)),
+        cor_tbr_import = safe_cor(weighted_tbr_change, import_change_pct),
+        .groups = "drop"
+      ) %>%
+      filter(n_pairs >= input$min_pairs, !is.na(cor_tbr_import)) %>%
+      arrange(cor_tbr_import)
+  })
+
+  # ranking bar chart (y-axis uses your combined 'commodity' label)
+  output$rank_plot <- renderPlot({
+    df <- subsector_corr() %>% slice_head(n = input$topn)
+    validate(need(nrow(df) > 0, "No commodities meet the filters. Try lowering Min. pairs or widening the year range."))
+    ggplot(df, aes(x = reorder(Commodity, cor_tbr_import), y = cor_tbr_import)) +
+      geom_col() +
+      coord_flip() +
+      labs(
+        title = paste0("Subsector ", input$subsector4, " — Substitution signal (ΔTBR vs ΔImport)"),
+        x = NULL, y = "Correlation (more negative = stronger substitution)"
+      ) +
+      theme_minimal(base_size = 13) +
+    theme(
+      axis.title = element_text(size = 14, face = "bold"),
+      axis.text  = element_text(size = 12),
+      plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+      legend.title = element_text(size = 15),
+      legend.text  = element_text(size = 14)
+    )
+  })
+
+  # ranking data table (show code + your combined label)
+  output$rank_table <- renderDT({
+    subsector_corr() %>%
+      mutate(rank = row_number()) %>%
+      select(rank, commodity_code, Commodity, n_pairs, cor_tbr_import) %>%
+      datatable(rownames = FALSE, options = list(pageLength = 10))
+  })
+
+  # product picker (value = code, label = your combined 'commodity')
+  output$pick_products_ui <- renderUI({
+    df <- subsector_corr() %>% slice_head(n = input$topn)
+    choices <- setNames(df$commodity_code, df$Commodity)  # label shows "code + name" from your column
+    selectizeInput("pick_codes", "Choose commodities to plot:",
+                   choices = choices, multiple = TRUE,
+                   selected = head(df$commodity_code, min(3, length(df$commodity_code))))
+  })
+
+  # scatter: ΔTBR vs ΔImport for selected commodities (color legend shows your 'commodity' label)
+  output$scatter_plot <- renderPlot({
+    req(input$pick_codes)
+    df <- subsector_df() %>% filter(commodity_code %in% input$pick_codes)
+    validate(need(nrow(df) > 0, "No data for selected commodities / years"))
+    ggplot(df, aes(x = weighted_tbr_change, y = import_change_pct, color = Commodity)) +
+      geom_point() +
+      geom_smooth(method = "lm", se = FALSE) +
+      labs(
+        title = paste0("ΔTBR vs ΔImport (%) — Subsector ", input$subsector4),
+        x = "ΔTBR (tariff-pressure change)", y = "Δ Import (%)", color = "Commodity"
+      ) +
+      theme_minimal(base_size = 13) +
+    theme(
+      axis.title = element_text(size = 14, face = "bold"),
+      axis.text  = element_text(size = 12),
+      plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+      legend.title = element_text(size = 15),
+      legend.text  = element_text(size = 14)
+    )
+  })
+
+  # trends: import levels over time (group/color by your 'commodity' label)
+  output$trend_plot <- renderPlot({
+    req(input$pick_codes)
+    df <- subsector_df() %>% filter(commodity_code %in% input$pick_codes)
+    validate(need(nrow(df) > 0, "No data for selected commodities / years"))
+    ggplot(df, aes(x = Year, y = total_import, color = Commodity, group = Commodity)) +
+      geom_line() + geom_point() +
+      scale_y_continuous(label = label_number(scale_cut = cut_short_scale()), expand = c(0,0,0.1,0.1)) +
+      labs(title = paste0("Import levels over time — Subsector ", input$subsector4),
+           y = "Total Import (US$)", color = "Commodity") +
+      theme_minimal(base_size = 13) +
+    theme(
+      axis.title = element_text(size = 14, face = "bold"),
+      axis.text  = element_text(size = 12),
+      plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+      legend.title = element_text(size = 15),
+      legend.text  = element_text(size = 14)
+    )
+  })
+
+  # coverage: how many years per commodity (uses your 'commodity' label)
+  output$coverage_plot <- renderPlot({
+    df <- subsector_df() %>%
+      group_by(Commodity) %>%
+      summarise(n_years = n_distinct(Year), .groups = "drop") %>%
+      arrange(n_years, Commodity)
+    validate(need(nrow(df) > 0, "No data in this subsector / year range"))
+    ggplot(df, aes(x = reorder(Commodity, n_years), y = n_years)) +
+      geom_col() +
+      coord_flip() +
+      labs(title = "Year coverage per commodity", x = NULL, y = "Distinct years") +
+      theme_minimal(base_size = 13) +
+    theme(
+      axis.title = element_text(size = 14, face = "bold"),
+      axis.text  = element_text(size = 12),
+      plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+      legend.title = element_text(size = 15),
+      legend.text  = element_text(size = 14)
+    )
+  })
+}
+
+shinyApp(ui, server)
+
+
+
+```
+
+
+
+
+#GEOGRAPHIC SUBSTITUTION
+
+```{r}
+
+
+geo_sum = data %>%
+  mutate(commodity_code = as.character(commodity_code)) %>%
+  filter(str_length(commodity_code) == 4) %>%
+  group_by(Year, commodity_code) %>%
+  mutate(import_share = Total.Import.US / sum(Total.Import.US, na.rm = TRUE)) %>%
+  ungroup()%>%
+  arrange(Country, commodity_code, Year) %>%
+  group_by(Country, commodity_code) %>%
+  mutate(
+    tbr_change = trade_balance_ratio - lag(trade_balance_ratio),
+    import_share_change = import_share - lag(import_share)
+  ) %>%
+  ungroup()
+
+
+geo_correlation <- geo_sum %>%
+  group_by(commodity_code, commodity_name) %>%
+  summarise(
+    n_complete = sum(complete.cases(tbr_change, import_share_change)),
+    cor_geo = ifelse(
+      n_complete >= 2,
+      cor(tbr_change, import_share_change, use = "complete.obs"),
+      NA_real_
+    ),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(cor_geo)) %>%
+  arrange(cor_geo)
+
+
+
+
+```
+
+
+
+```{r}
+
+
+safe_cor <- function(x, y) {
+  ok <- is.finite(x) & is.finite(y)
+  if (sum(ok) >= 2 && sd(x[ok]) > 0 && sd(y[ok]) > 0) cor(x[ok], y[ok]) else NA_real_
+}
+
+
+
+
+geo_sum <- geo_sum %>%
+  mutate(commodity_code = as.character(commodity_code),
+         Year = as.integer(Year)) %>%
+  filter(str_length(commodity_code) == 4)
+
+
+ui <- fluidPage(
+  titlePanel("Geographic Substitution — Industry × Country"),
+  sidebarLayout(
+    sidebarPanel(
+      # Industry selector (label shows "code — name")
+      selectInput("industry4", "Choose Industry (4-digit):", choices = NULL, width = "100%"),
+      # Countries selector depends on industry
+      selectizeInput("countries", "Choose Countries:", choices = NULL, multiple = TRUE, width = "100%"),
+      sliderInput(
+        "year_range", "Year range:",
+        min = min(geo_sum$Year, na.rm = TRUE),
+        max = max(geo_sum$Year, na.rm = TRUE),
+        value = c(min(geo_sum$Year, na.rm = TRUE), max(geo_sum$Year, na.rm = TRUE)),
+        step = 1, sep = ""
+      ),
+      numericInput("min_pairs", "Min. complete year-pairs per country:", 3, min = 2, max = 9, step = 1),
+      helpText("Correlation is between ΔTBR and Δ Import% (YoY) per country.")
+    ),
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Import value",  br(), plotOutput("p_value", height = 420)),
+        tabPanel("ΔImport% vs ΔTBR", br(), plotOutput("p_scatter", height = 420)),
+        tabPanel("Correlation",   br(),
+                 verbatimTextOutput("overall_cor"),
+                 DTOutput("tbl_cor"))
+      )
+    )
+  )
+)
+
+
+server <- function(input, output, session){
+
+ 
+  observe({
+    ind_choices <- geo_sum %>%
+      distinct(commodity_code, commodity_name) %>%
+      arrange(commodity_code, commodity_name) %>%
+      mutate(lbl = paste0(commodity_code, " — ", commodity_name))
+    updateSelectInput(session, "industry4",
+      choices = setNames(ind_choices$commodity_code, ind_choices$lbl),
+      selected = ind_choices$commodity_code[1]
+    )
+  })
+
+  
+  observeEvent(input$industry4, {
+    req(input$industry4)
+    cty <- geo_sum %>%
+      filter(commodity_code == input$industry4) %>%
+      distinct(Country) %>%
+      arrange(Country) %>%
+      pull(Country)
+    updateSelectizeInput(session, "countries",
+      choices = cty,
+      selected = head(cty, min(4, length(cty)))
+    )
+  }, ignoreInit = TRUE)
+
+ 
+  d_industry <- reactive({
+    req(input$industry4)
+    geo_sum %>%
+      filter(commodity_code == input$industry4,
+             Year >= input$year_range[1],
+             Year <= input$year_range[2])
+  })
+
+  
+  d_change <- reactive({
+    df <- d_industry()
+    validate(need(nrow(df) > 0, "No data in this industry/year range."))
+    df %>%
+      arrange(Country, Year) %>%
+      group_by(Country) %>%
+      mutate(
+        import_change_pct = (Total.Import.US - lag(Total.Import.US)) / lag(Total.Import.US),
+        tbr_change_local  = trade_balance_ratio - lag(trade_balance_ratio)
+      ) %>%
+      ungroup()
+  })
+
+  
+  d_selected <- reactive({
+    req(input$countries)
+    d_change() %>% filter(Country %in% input$countries)
+  })
+
+ 
+
+  # 1) Import value over time
+  output$p_value <- renderPlot({
+    d <- d_selected()
+    validate(need(nrow(d) > 0, "No rows for selected countries."))
+    ggplot(d, aes(x = Year, y = Total.Import.US, color = Country, group = Country)) +
+      geom_line(linewidth = 1) +
+      geom_point(size = 1.8, alpha = 0.85) +
+      scale_y_continuous(labels = label_number(scale_cut = cut_short_scale(), big.mark=",")) +
+      labs(title = "Import value over time",
+           x = "Year", y = "Import value (US$)") +
+      theme_minimal(base_size = 14) +
+      theme(legend.position = "bottom", legend.title = element_blank(),
+            axis.title = element_text(size = 14, face = "bold"),
+            axis.text  = element_text(size = 12),
+            plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+            legend.text  = element_text(size = 14))
+  })
+
+  # 2) YoY % change in import value
+ output$p_scatter <- renderPlot({
+  d <- d_selected() %>% 
+       filter(is.finite(import_change_pct), is.finite(tbr_change_local))
+  validate(need(nrow(d) > 0, "Not enough consecutive years to compute Δs for the selected countries."))
+
+  ggplot(d, aes(x = tbr_change_local, y = import_change_pct, color = Country)) +
+    geom_hline(yintercept = 0, linewidth = 0.3) +
+    geom_vline(xintercept = 0, linewidth = 0.3) +
+    geom_point(alpha = 0.85, size = 2) +
+    geom_smooth(method = "lm", se = FALSE, linewidth = 1) +
+    scale_y_continuous(labels = scales::label_percent(accuracy = 0.1)) +
+    labs(
+      title = "ΔImport% vs ΔTBR (per selected countries)",
+      x = "ΔTBR (year-over-year)",
+      y = "Δ Import (%)",
+      color = "Country"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(legend.position = "bottom", axis.title = element_text(size = 14, face = "bold"),
+      axis.text  = element_text(size = 12),
+      plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+      legend.title = element_text(size = 15),
+      legend.text  = element_text(size = 14))
+})
+
+
+
+  # per-country correlation table (ΔTBR vs ΔImport%)
+  country_cor <- reactive({
+    d <- d_selected()
+    d %>%
+      group_by(Country) %>%
+      summarise(
+        n_pairs = sum(is.finite(tbr_change_local) & is.finite(import_change_pct)),
+        cor_geo = safe_cor(tbr_change_local, import_change_pct),
+        .groups = "drop"
+      ) %>%
+      filter(n_pairs >= input$min_pairs, !is.na(cor_geo)) %>%
+      arrange(cor_geo)
+  })
+
+  # overall pooled correlation across selected countries
+  output$overall_cor <- renderText({
+    d <- d_selected() %>% filter(is.finite(tbr_change_local), is.finite(import_change_pct))
+    if (nrow(d) < 2 || sd(d$tbr_change_local) == 0 || sd(d$import_change_pct) == 0) {
+      return("Overall correlation (ΔTBR vs ΔImport%): NA (insufficient variation).")
+    }
+    paste0(
+      "Overall correlation (ΔTBR vs ΔImport%) — selected industry & countries: ",
+      round(cor(d$tbr_change_local, d$import_change_pct), 3)
+    )
+  })
+
+  output$tbl_cor <- renderDT({
+    df <- country_cor()
+    validate(need(nrow(df) > 0, "No countries meet the minimum complete-pairs requirement."))
+    datatable(df, rownames = FALSE, options = list(pageLength = 10),
+              colnames = c("Country", "Complete pairs", "Correlation (ΔTBR, ΔImport%)")) %>%
+      formatRound("cor_geo", 3)
+  })
+
+}
+
+shinyApp(ui, server)
+
+
+
+
+```
+
+
